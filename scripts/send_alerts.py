@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Ivy 2028 deadline alerts → astrodastic@gmail.com.
+"""Ivy-2028 deadline alerts → astrodastic@gmail.com.
 
-Reads the latest pipeline CSV, finds urgent (<=7d) and upcoming (<=30d)
+Reads the latest ivy-2028 pipeline CSV, finds urgent (<=7d) and upcoming (<=30d)
 deadlines and emails a digest with the app URL.
+
+This is the ivy-2028 successor to the ivy-2028-v2 send_alerts.py. The LIVE copy
+runs on Zeus at ~/.hermes/scripts/ivy-2028-deadline-alerts.py (it needs
+~/.hermes/google_token.json, which only exists there). This repo copy is the
+source of truth — when it changes, copy it to Zeus.
 
 DEDUPE: the pipeline only refreshes the CSV weekly, so an unguarded daily job
 re-emailed the same list six mornings out of seven. State lives in
-~/.hermes/scripts/ivy-alerts-state.json::
+~/.hermes/scripts/ivy-2028-alerts-state.json::
 
     {"items": {"<name>|<YYYY-MM-DD deadline>": "urgent|upcoming"},
      "last_email": "<iso>|null", "last_subject": "<str>|null",
@@ -38,6 +43,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,12 +51,12 @@ from datetime import date, datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-APP_URL = "https://gudguliai.github.io/ivy/"
+APP_URL = "https://gudguliai.github.io/ivy-2028/"
 TO_EMAIL = "astrodastic@gmail.com"
 FROM_EMAIL = "gudguliai@gmail.com"
 TOKEN_PATH = os.path.expanduser("~/.hermes/google_token.json")
-STATE_PATH = os.path.expanduser("~/.hermes/scripts/ivy-alerts-state.json")
-JOB_NAME = "ivy-deadline-alerts"
+STATE_PATH = os.path.expanduser("~/.hermes/scripts/ivy-2028-alerts-state.json")
+JOB_NAME = "ivy-2028-deadline-alerts"
 NOTIFY_TARGET = "telegram"
 STALE_HOURS = 40          # notify if the previous run was this long ago
 URGENT_DAYS = 7
@@ -61,7 +67,7 @@ UPCOMING_DAYS = 30
 
 def latest_csv() -> str:
     files = sorted(glob.glob(
-        os.path.expanduser("~/projects/ivy-2028-v2/output/*results.csv")))
+        os.path.expanduser("~/projects/ivy-2028/output/*ivy_2028-results.csv")))
     return files[-1] if files else None
 
 
@@ -146,22 +152,39 @@ def decide(current: dict, previous: dict):
 
 # --------------------------------------------------------------------- delivery
 
+def _refresh_once(cred):
+    """Single refresh attempt; returns the new access token or raises."""
+    data = urllib.parse.urlencode({
+        "client_id": cred["client_id"],
+        "client_secret": cred["client_secret"],
+        "refresh_token": cred["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode()
+    req = urllib.request.Request(cred["token_uri"], data=data)
+    tok = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+    cred["token"] = tok["access_token"]
+    with open(TOKEN_PATH, "w") as fh:
+        json.dump(cred, fh, indent=2)
+    return cred["token"]
+
+
 def _refresh_if_needed(cred):
-    """Refresh the Google access token via refresh_token; update the file."""
-    try:
-        data = urllib.parse.urlencode({
-            "client_id": cred["client_id"],
-            "client_secret": cred["client_secret"],
-            "refresh_token": cred["refresh_token"],
-            "grant_type": "refresh_token",
-        }).encode()
-        req = urllib.request.Request(cred["token_uri"], data=data)
-        tok = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
-        cred["token"] = tok["access_token"]
-        json.dump(cred, open(TOKEN_PATH, "w"), indent=2)
-        return cred["token"]
-    except Exception:
-        return None
+    """Refresh the Google access token via refresh_token; update the file.
+
+    Retries once after a short pause: a single transient network blip at 8 AM
+    used to kill the whole run (Sep 26, 2026). Returns None only if both
+    attempts fail.
+    """
+    last = None
+    for _attempt in range(2):
+        try:
+            return _refresh_once(cred)
+        except Exception as exc:                  # noqa: BLE001 — retried
+            last = exc
+            time.sleep(5)
+    print(f"token refresh failed twice: {type(last).__name__}: {last}",
+          file=sys.stderr)
+    return None
 
 
 def send_email(subject, html_body, to_email=TO_EMAIL):
@@ -225,7 +248,7 @@ def main():
 
     csv_path = latest_csv()
     if not csv_path:
-        raise RuntimeError("no results CSV in ~/projects/ivy-2028-v2/output/")
+        raise RuntimeError("no results CSV in ~/projects/ivy-2028/output/")
     with open(csv_path) as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
