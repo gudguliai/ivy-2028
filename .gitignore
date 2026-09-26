@@ -1,0 +1,6 @@
+ivy_2028.db
+ivy_2028.db-shm
+ivy_2028.db-wal
+/tmp/
+.DS_Store
+__pycache__/
