@@ -5,13 +5,25 @@ Reads the latest ivy-2028 pipeline CSV, finds urgent (<=7d) and upcoming (<=30d)
 deadlines and emails a digest with the app URL.
 
 This is the ivy-2028 successor to the ivy-2028-v2 send_alerts.py. The LIVE copy
-runs on Zeus at ~/.hermes/scripts/ivy-2028-deadline-alerts.py (it needs
-~/.hermes/google_token.json, which only exists there). This repo copy is the
-source of truth — when it changes, copy it to Zeus.
+runs on this VM (the Gmail token that used to live on Zeus died Oct 3, 2026 —
+Google revoked the refresh token, invalid_grant). Sending now goes through the
+VM's Gmail connector (gudguliai@gmail.com, send scope granted) instead of a
+token file. A copy is kept at ~/.hermes/scripts/ivy-2028-deadline-alerts.py on
+Zeus for reference only; nothing on Zeus runs it anymore.
+
+Environment (all optional unless noted):
+  IVY_ALERT_SEND_VIA      "token" (default, needs ~/.hermes/google_token.json)
+                          or "connector" (uses hatch_gws_cli on this VM)
+  IVY_ALERT_GMAIL_ACCOUNT Gmail connector account id — REQUIRED for connector
+                          mode (the gudguliai@gmail.com account)
+  IVY_ALERT_STATE         state file path (default
+                          ~/.hermes/scripts/ivy-2028-alerts-state.json)
+  IVY_ALERT_CSV_GLOB      results-CSV glob (default
+                          ~/projects/ivy-2028/output/*ivy_2028-results.csv)
 
 DEDUPE: the pipeline only refreshes the CSV weekly, so an unguarded daily job
-re-emailed the same list six mornings out of seven. State lives in
-~/.hermes/scripts/ivy-2028-alerts-state.json::
+re-emailed the same list six mornings out of seven. State lives in the
+IVY_ALERT_STATE file::
 
     {"items": {"<name>|<YYYY-MM-DD deadline>": "urgent|upcoming"},
      "last_email": "<iso>|null", "last_subject": "<str>|null",
@@ -55,7 +67,12 @@ APP_URL = "https://gudguliai.github.io/ivy-2028/"
 TO_EMAIL = "astrodastic@gmail.com"
 FROM_EMAIL = "gudguliai@gmail.com"
 TOKEN_PATH = os.path.expanduser("~/.hermes/google_token.json")
-STATE_PATH = os.path.expanduser("~/.hermes/scripts/ivy-2028-alerts-state.json")
+STATE_PATH = os.path.expanduser(os.environ.get(
+    "IVY_ALERT_STATE", "~/.hermes/scripts/ivy-2028-alerts-state.json"))
+CSV_GLOB = os.path.expanduser(os.environ.get(
+    "IVY_ALERT_CSV_GLOB", "~/projects/ivy-2028/output/*ivy_2028-results.csv"))
+SEND_VIA = os.environ.get("IVY_ALERT_SEND_VIA", "token")  # token | connector
+GMAIL_ACCOUNT = os.environ.get("IVY_ALERT_GMAIL_ACCOUNT", "")
 JOB_NAME = "ivy-2028-deadline-alerts"
 NOTIFY_TARGET = "telegram"
 STALE_HOURS = 40          # notify if the previous run was this long ago
@@ -66,8 +83,7 @@ UPCOMING_DAYS = 30
 # ---------------------------------------------------------------- pipeline data
 
 def latest_csv() -> str:
-    files = sorted(glob.glob(
-        os.path.expanduser("~/projects/ivy-2028/output/*ivy_2028-results.csv")))
+    files = sorted(glob.glob(CSV_GLOB))
     return files[-1] if files else None
 
 
@@ -187,7 +203,33 @@ def _refresh_if_needed(cred):
     return None
 
 
+def send_via_connector(subject, html_body, to_email=TO_EMAIL):
+    """Send through the VM's Gmail connector (hatch_gws_cli).
+
+    Used since Oct 3, 2026, when Google revoked the Zeus token's refresh
+    grant (invalid_grant) and the token backend died. Requires
+    IVY_ALERT_GMAIL_ACCOUNT to be the gudguliai@gmail.com connector id.
+    """
+    if not GMAIL_ACCOUNT:
+        raise RuntimeError("IVY_ALERT_GMAIL_ACCOUNT is not set — connector "
+                           "send needs the Gmail account id")
+    exe = shutil.which("hatch_gws_cli") or "/opt/hatch/bin/hatch_gws_cli"
+    cmd = [exe, "gmail", "+send", "--account", GMAIL_ACCOUNT,
+           "--to", to_email, "--subject", subject,
+           "--body", html_body, "--html"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"connector send failed: {proc.stderr.strip()[:300]}")
+    try:
+        return json.loads(proc.stdout).get("id", "connector-sent")
+    except Exception:                             # noqa: BLE001 — id optional
+        return "connector-sent"
+
+
 def send_email(subject, html_body, to_email=TO_EMAIL):
+    if SEND_VIA == "connector":
+        return send_via_connector(subject, html_body, to_email)
     cred = json.load(open(TOKEN_PATH))
     access = cred.get("token")
 
@@ -217,7 +259,11 @@ def send_email(subject, html_body, to_email=TO_EMAIL):
 
 def notify(text: str) -> None:
     """Best-effort Telegram ping via the Hermes CLI. Never raises."""
-    exe = shutil.which("hermes") or "/opt/homebrew/bin/hermes"
+    exe = shutil.which("hermes")
+    if not exe:
+        # No Hermes CLI on this machine (e.g. the VM) — log and move on.
+        print(f"notify skipped (no hermes CLI): {text}", file=sys.stderr)
+        return
     try:
         subprocess.run([exe, "send", "--to", NOTIFY_TARGET, text],
                        capture_output=True, timeout=90, check=False)
@@ -235,9 +281,16 @@ def main():
                     help="ignore dedupe state and send now")
     ap.add_argument("--seed", action="store_true",
                     help="record the current CSV as already alerted, no email")
+    ap.add_argument("--send-via", choices=["token", "connector"],
+                    default=None,
+                    help="override IVY_ALERT_SEND_VIA for this run")
     ap.add_argument("--state", default=STATE_PATH)
     ap.add_argument("--to", default=TO_EMAIL)
     args = ap.parse_args()
+
+    global SEND_VIA
+    if args.send_via:
+        SEND_VIA = args.send_via
 
     lock = open(args.state + ".lock", "w")
     try:
@@ -248,7 +301,7 @@ def main():
 
     csv_path = latest_csv()
     if not csv_path:
-        raise RuntimeError("no results CSV in ~/projects/ivy-2028/output/")
+        raise RuntimeError(f"no results CSV matching {CSV_GLOB}")
     with open(csv_path) as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
