@@ -69,8 +69,6 @@ FROM_EMAIL = "gudguliai@gmail.com"
 TOKEN_PATH = os.path.expanduser("~/.hermes/google_token.json")
 STATE_PATH = os.path.expanduser(os.environ.get(
     "IVY_ALERT_STATE", "~/.hermes/scripts/ivy-2028-alerts-state.json"))
-CSV_GLOB = os.path.expanduser(os.environ.get(
-    "IVY_ALERT_CSV_GLOB", "~/projects/ivy-2028/output/*ivy_2028-results.csv"))
 SEND_VIA = os.environ.get("IVY_ALERT_SEND_VIA", "token")  # token | connector
 GMAIL_ACCOUNT = os.environ.get("IVY_ALERT_GMAIL_ACCOUNT", "")
 JOB_NAME = "ivy-2028-deadline-alerts"
@@ -83,8 +81,20 @@ UPCOMING_DAYS = 30
 # ---------------------------------------------------------------- pipeline data
 
 def latest_csv() -> str:
-    files = sorted(glob.glob(CSV_GLOB))
-    return files[-1] if files else None
+    # Try the configured glob first, then sensible defaults per machine.
+    # (Oct 4, 2026: a cron worker's shell once passed the glob unexpanded;
+    # the fallbacks keep the run working regardless.)
+    candidates = []
+    env_glob = os.environ.get("IVY_ALERT_CSV_GLOB", "")
+    if env_glob:
+        candidates.append(env_glob)
+    candidates.append("~/workspace/ivy-2028/output/*ivy_2028-results.csv")
+    candidates.append("~/projects/ivy-2028/output/*ivy_2028-results.csv")
+    for cand in candidates:
+        files = sorted(glob.glob(os.path.expanduser(cand)))
+        if files:
+            return files[-1]
+    return None
 
 
 def parse_deadline(raw: str):
@@ -301,7 +311,8 @@ def main():
 
     csv_path = latest_csv()
     if not csv_path:
-        raise RuntimeError(f"no results CSV matching {CSV_GLOB}")
+        raise RuntimeError("no results CSV found (tried IVY_ALERT_CSV_GLOB "
+                           "and the default VM/Zeus locations)")
     with open(csv_path) as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
